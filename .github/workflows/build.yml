@@ -1,0 +1,215 @@
+# Builds ClipboardManager (Windows, WinUI 3) on GitHub's Windows runners and puts the installer on a Release
+# (nolumiatask #1132). The same shape as kiyoteruhosoda/nolumiascheduler-build.
+#
+# ⚠ A throwaway repo. If it disappears, only distribution stops; the source of truth is the private
+#   kiyoteruhosoda/ClipboardManager. The owner chose this public builder (2026-11-24) knowing that the built
+#   exe is public here for a while; the source stays private and is read with a read-only deploy key
+#   (secret SOURCE_DEPLOY_KEY).
+# Flow:
+#   1. On a schedule, or when the home side (forge kyon/clipboardmanager-build) dispatches it, look at the head
+#      of main of the source. Do nothing if it was already built (tag build-<sha>) or failed (tag failed-<sha>)
+#   2. On Windows, run the tests, publish the app self-contained and make Setup.exe, Portable.zip and the update
+#      bundle with Velopack
+#   3. Put them on a Release (tag build-<sha>) of this repo and delete the older Releases
+#   4. The home side pulls the Release into share.nolumia.com (the home storage cannot be written from outside,
+#      so this side holds no key for it)
+#   Every build attempt writes status.json on the branch "status" (sha, version, result) so the home side can
+#   announce a failed build to the notice monitor (this side holds no notice key). A failure also adds the tag
+#   failed-<sha>, so the same commit is not rebuilt until it is dispatched with force.
+name: build
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit of the source to build (empty: head of main)"
+        required: false
+        default: ""
+      force:
+        description: "Build even if this commit was already built or failed"
+        type: boolean
+        default: false
+      publish:
+        description: "Put it on a Release (off: keep it only as a run artifact, for trying a branch)"
+        type: boolean
+        default: true
+      fail:
+        description: "Fail on purpose (to check the alert)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: kiyoteruhosoda/ClipboardManager
+
+jobs:
+  check:
+    name: Decide whether to build
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick the commit
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_SHA: ${{ inputs.sha }}
+          FORCE: ${{ inputs.force }}
+          DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          # Scheduled runs stop after 60 days without activity; re-enable once a month (only at 00:xx on the 1st,
+          # since re-enabling every time may re-register the schedule and keep it from firing).
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$(date -u +%d%H)" = "0100" ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/enable" || true
+          fi
+          sha="$INPUT_SHA"
+          if [ -z "$sha" ]; then
+            key="$RUNNER_TEMP/deploy_key"
+            printf '%s\n' "$DEPLOY_KEY" > "$key"
+            chmod 600 "$key"
+            sha=$(GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+              git ls-remote "git@github.com:$SOURCE_REPO.git" refs/heads/main | cut -f1)
+            rm -f "$key"
+          fi
+          [ -n "$sha" ] || { echo "Could not read the head of main"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = true ] || [ -n "$INPUT_SHA" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          for t in "build-$sha" "failed-$sha"; do
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$t" >/dev/null 2>&1; then
+              echo "$t exists; not building"
+              echo "build=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          done
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (Windows)
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      SHA: ${{ needs.check.outputs.sha }}
+      # inputs are empty on scheduled runs, so publishing is the default.
+      PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - name: Fail on purpose
+        if: inputs.fail
+        run: |
+          echo "Failing on purpose to check the alert."
+          exit 1
+
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SHA }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          path: src
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      # The version has the WinTrack / NolumiaScheduler shape (1.0.<commit count>). Velopack updates only when it goes up.
+      - name: Decide the version
+        id: version
+        run: |
+          v="1.0.$(git -C src rev-list --count HEAD)"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: dotnet test src/ClipboardManagerTest/ClipboardManagerTest.csproj -c Release
+
+      - name: Publish the app (with the WinUI screens)
+        run: >-
+          dotnet publish src/ClipboardManager/ClipboardManager.csproj
+          -c Release -r win-x64 -p:Platform=x64 -p:Version="$VERSION" -o publish
+
+      # ⚠ packId is not ClipboardManager. Velopack installs into %LocalAppData%\<packId> and deletes that folder on
+      #   uninstall; the app keeps its history in %LocalAppData%\ClipboardManager, which would go with it.
+      - name: Make the installer (Velopack)
+        run: |
+          dotnet tool install --tool-path tools vpk --version 1.2.158
+          tools/vpk pack \
+            --packId ClipboardManagerWin \
+            --runtime win-x64 \
+            --packVersion "$VERSION" \
+            --packDir publish \
+            --mainExe ClipboardManager.exe \
+            --packTitle ClipboardManager \
+            --packAuthors Nolumia \
+            --outputDir Releases
+          (cd Releases && sha256sum * > SHA256SUMS)
+          ls -la Releases
+
+      - name: Keep as a run artifact (trying a branch)
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: Releases
+          path: Releases
+          retention-days: 3
+
+      - name: Put on a Release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf 'version: %s\nsource commit: %s\n' "$VERSION" "$SHA" > notes.txt
+          gh release delete "build-$SHA" -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
+          gh release create "build-$SHA" Releases/* -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "ClipboardManager $VERSION" --notes-file notes.txt
+          # Keep only this one (the home side pulls the latest only).
+          gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' \
+            | { grep -vx "build-$SHA" || true; } \
+            | while read -r t; do gh release delete "$t" -R "$GITHUB_REPOSITORY" --cleanup-tag -y; done
+
+  record:
+    name: Record the result
+    needs: [check, build]
+    # Only real build attempts that would be published (not a branch trial) are recorded.
+    if: always() && needs.check.outputs.build == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write status.json and mark a failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.check.outputs.sha }}
+          VERSION: ${{ needs.build.outputs.version }}
+          RESULT: ${{ needs.build.result }}
+        run: |
+          result=failed
+          [ "$RESULT" = success ] && result=ok
+          if [ "$result" = failed ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/failed-$SHA" -f sha="$GITHUB_SHA" >/dev/null || true
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(jq -cn --arg sha "$SHA" --arg version "$VERSION" --arg result "$result" --arg run "$run_url" \
+            '{sha: $sha, version: $version, result: $result, run: $run}')
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/status.json?ref=status" -q .sha 2>/dev/null || true)
+          args=(-X PUT "repos/$GITHUB_REPOSITORY/contents/status.json" -f branch=status
+                -f message="status: $result ${SHA:0:7}" -f content="$(printf '%s' "$body" | base64 -w0)")
+          [ -n "$current" ] && args+=(-f sha="$current")
+          gh api "${args[@]}" >/dev/null
+          echo "$body"
